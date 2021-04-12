@@ -6,10 +6,18 @@ const fccTesting = require('./freeCodeCamp/fcctesting.js');
 
 const passport = require('passport');
 const session = require('express-session');
-const ObjectID = require('mongodb').ObjectID;
-const LocalStrategy = require('passport-local');
+const routes = require('./routes.js');
+const auth = require('./auth.js');
 
 const app = express();
+const http = require('http').createServer(app);
+const io = require('socket.io')(http);
+const passportSocketIo = require('passport.socketio');
+const cookieParser = require('cookie-parser');
+const MongoStore = require('connect-mongo')(session);
+const URI = process.env.MONGO_URI;
+const store = new MongoStore({ url: URI });
+
 app.set('view engine', 'pug');
 
 fccTesting(app); //For FCC testing purposes
@@ -23,97 +31,74 @@ app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: true,
   saveUninitialized: true,
-  cookie: { secure: false }
+  cookie: { secure: false },
+  key: 'express.sid',
+  store: store
 }));
 
 app.use(passport.initialize());
 app.use(passport.session());
 
+io.use(
+  passportSocketIo.authorize({
+    cookieParser: cookieParser,
+    key: 'express.sid',
+    secret: process.env.SESSION_SECRET,
+    store: store,
+    success: onAuthorizeSuccess,
+    fail: onAuthorizeFail
+  })
+);
+
 myDB(async client => {
   const myDataBase = await client.db('database').collection('users');
 
-  app.route('/').get((req, res) => {
-    res.render('pug', {
-      title: 'Connected to Database',
-      message: 'Please login',
-      showLogin: true,
-      showRegistration: true,
-      showSocialAuth: false
+  routes(app, myDataBase);
+  auth(app, myDataBase);
+
+  let currentUsers = 0;
+  io.on('connection', socket => {
+    ++currentUsers;
+    io.emit('user', {
+      name: socket.request.user.name,
+      currentUsers,
+      connected: true
     });
-  });
+    
+    socket.on('chat message', message => io.emit('chat message', { name: socket.request.user.name, message }));
 
-  app.post('/login', passport.authenticate('local', {failureRedirect: '/'}), (req, res) => {
-    res.redirect('/profile', { username: req.user.username });
-  });
+    console.log('user ' + socket.request.user.name + ' connected');
 
-  app.get('/profile', ensureAuthenticated, (req, res) => {
-    res.render(process.cwd() + '/views/pug/profile');
-  });
-
-  app.get('/logout', (req, res) => {
-    req.logout();
-    res.redirect('/');
-  });
-
-  app.route('/register')
-    .post((req, res, next) => {
-      myDataBase.findOne({ username: req.body.username }, (err, user) => {
-        if(err) next(err);
-        else if(user) res.redirect('/');
-        else {
-          myDataBase.insertOne({ username: req.body.username, password: req.body.password },
-            (err, doc) => {
-              if(err) res.redirect('/');
-              else next(null, doc.ops[0]);
-            });
-        }
+    socket.on('disconnect', () => {
+      console.log('user ' + socket.request.user.name + 'has disconnected');
+      --currentUsers;
+      io.emit('user', {
+        name: socket.request.user.name,
+        currentUsers,
+        connected: false
       });
-    },
-    passport.authenticate('local', {failureRedirect: '/'}),
-    (req, res, next) => res.redirect('/profile')
-    );
-
-  app.use((req, res) => {
-    res.status(400)
-      .type('text')
-      .send('Not found');
-  })
-
-  passport.serializeUser((user, done) => {
-    done(null, user._id);
-  });
-
-  passport.deserializeUser((id, done) => {
-    myDataBase.findOne({ _id: new ObjectID(id) }, (err, doc) => {
-      done(null, doc);
     });
+
   });
-
-  passport.use(new LocalStrategy(
-    function(username, password, done) {
-      myDataBase.findOne({ username: username }, function (err, user) {
-        console.log('User '+ username +' attempted to log in.');
-        if (err) { return done(err); }
-        if (!user) { return done(null, false); }
-        if (password !== user.password) { return done(null, false); }
-        return done(null, user);
-      });
-    }
-  ));
-
 }).catch(e => {
-  app.route('/').get((req, res) => {
-    res.render('pug', { title: e, message: 'Unable to login' });
-  });
+  app.route('/').get((req, res) => res.render('pug', { title: e, message: 'Unable to login' }));
 });
 
-function ensureAuthenticated(req, res, next){
-  if(req.isAuthenticated()) return next();
-  res.redirect('/');
+function onAuthorizeSuccess(data, accept) {
+  console.log('successful connection to socket.io');
+
+  accept(null, true);
 }
+
+function onAuthorizeFail(data, message, error, accept) {
+  if (error) throw new Error(message);
+  console.log('failed connection to socket.io:', message);
+  accept(null, false);
+}
+
 // 
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+http.listen(PORT, () => {
   console.log('Listening on port ' + PORT);
 });
